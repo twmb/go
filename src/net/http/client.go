@@ -500,7 +500,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		deadline      = c.deadline()
 		reqs          []*Request
 		resp          *Response
-		copyHeaders   = c.makeHeadersCopier(req)
+		hdrCopier     = c.makeHeadersCopier(req)
 		reqBodyClosed = false // have we closed the current req.Body?
 
 		// Redirect behavior:
@@ -571,7 +571,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 			// in case the user set Referer on their first request.
 			// If they really want to override, they can do it in
 			// their CheckRedirect func.
-			copyHeaders(req)
+			hdrCopier.copyInto(req)
 
 			// Add the Referer header from the most recent
 			// request URL to the new one, if it's not https->http:
@@ -634,68 +634,92 @@ func (c *Client) Do(req *Request) (*Response, error) {
 	}
 }
 
+type headersCopier struct {
+	jar CookieJar
+
+	ihdr     Header
+	icookie  string
+	icookies map[string][]*Cookie
+
+	preq *Request
+}
+
 // makeHeadersCopier makes a function that copies headers from the
 // initial Request, ireq. For every redirect, this function must be called
 // so that it can copy headers into the upcoming Request.
-func (c *Client) makeHeadersCopier(ireq *Request) func(*Request) {
-	// The headers to copy are from the very initial request.
-	// We use a closured callback to keep a reference to these original headers.
-	var (
-		ireqhdr  = ireq.Header.clone()
-		icookies map[string][]*Cookie
-	)
-	if c.Jar != nil && ireq.Header.Get("Cookie") != "" {
+func (c *Client) makeHeadersCopier(ireq *Request) headersCopier {
+	icookie := ireq.Header.Get("Cookie")
+
+	var icookies map[string][]*Cookie
+	if c.Jar != nil && icookie != "" {
 		icookies = make(map[string][]*Cookie)
 		for _, c := range ireq.Cookies() {
 			icookies[c.Name] = append(icookies[c.Name], c)
 		}
 	}
 
-	preq := ireq // The previous request
-	return func(req *Request) {
-		// If Jar is present and there was some initial cookies provided
-		// via the request header, then we may need to alter the initial
-		// cookies as we follow redirects since each redirect may end up
-		// modifying a pre-existing cookie.
-		//
-		// Since cookies already set in the request header do not contain
-		// information about the original domain and path, the logic below
-		// assumes any new set cookies override the original cookie
-		// regardless of domain or path.
-		//
-		// See https://golang.org/issue/17494
-		if c.Jar != nil && icookies != nil {
-			var changed bool
-			resp := req.Response // The response that caused the upcoming redirect
-			for _, c := range resp.Cookies() {
-				if _, ok := icookies[c.Name]; ok {
-					delete(icookies, c.Name)
-					changed = true
-				}
-			}
-			if changed {
-				ireqhdr.Del("Cookie")
-				var ss []string
-				for _, cs := range icookies {
-					for _, c := range cs {
-						ss = append(ss, c.Name+"="+c.Value)
-					}
-				}
-				sort.Strings(ss) // Ensure deterministic headers
-				ireqhdr.Set("Cookie", strings.Join(ss, "; "))
-			}
-		}
+	return headersCopier{
+		jar: c.Jar,
 
-		// Copy the initial request's Header values
-		// (at least the safe ones).
-		for k, vv := range ireqhdr {
-			if shouldCopyHeaderOnRedirect(k, preq.URL, req.URL) {
-				req.Header[k] = vv
-			}
-		}
+		icookie:  icookie,
+		icookies: icookies,
 
-		preq = req // Update previous Request with the current request
+		preq: ireq,
 	}
+}
+
+func (h *headersCopier) copyInto(req *Request) {
+	if h.ihdr == nil {
+		h.ihdr = h.preq.Header.clone()
+		if h.icookie == "" {
+			h.ihdr.Del("Cookie")
+		} else {
+			h.ihdr.Set("Cookie", h.icookie)
+		}
+	}
+
+	// If Jar is present and there was some initial cookies provided
+	// via the request header, then we may need to alter the initial
+	// cookies as we follow redirects since each redirect may end up
+	// modifying a pre-existing cookie.
+	//
+	// Since cookies already set in the request header do not contain
+	// information about the original domain and path, the logic below
+	// assumes any new set cookies override the original cookie
+	// regardless of domain or path.
+	//
+	// See https://golang.org/issue/17494
+	if h.jar != nil && h.icookies != nil {
+		var changed bool
+		resp := req.Response // The response that caused the upcoming redirect
+		for _, c := range resp.Cookies() {
+			if _, ok := h.icookies[c.Name]; ok {
+				delete(h.icookies, c.Name)
+				changed = true
+			}
+		}
+		if changed {
+			h.ihdr.Del("Cookie")
+			var ss []string
+			for _, cs := range h.icookies {
+				for _, c := range cs {
+					ss = append(ss, c.Name+"="+c.Value)
+				}
+			}
+			sort.Strings(ss) // Ensure deterministic headers
+			h.ihdr.Set("Cookie", strings.Join(ss, "; "))
+		}
+	}
+
+	// Copy the initial request's Header values
+	// (at least the safe ones).
+	for k, vv := range h.ihdr {
+		if shouldCopyHeaderOnRedirect(k, h.preq.URL, req.URL) {
+			req.Header[k] = vv
+		}
+	}
+
+	h.preq = req // Update previous Request with the current request
 }
 
 func defaultCheckRedirect(req *Request, via []*Request) error {
