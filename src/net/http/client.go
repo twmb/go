@@ -498,6 +498,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 
 	var (
 		deadline      = c.deadline()
+		ireq          = req
 		reqs          []*Request
 		resp          *Response
 		hdrCopier     = c.makeHeadersCopier(req)
@@ -512,7 +513,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		if !reqBodyClosed {
 			req.closeBody()
 		}
-		method := valueOrDefault(reqs[0].Method, "GET")
+		method := valueOrDefault(ireq.Method, "GET")
 		var urlStr string
 		if resp != nil && resp.Request != nil {
 			urlStr = stripPassword(resp.Request.URL)
@@ -548,7 +549,6 @@ func (c *Client) Do(req *Request) (*Response, error) {
 					host = req.Host
 				}
 			}
-			ireq := reqs[0]
 			req = &Request{
 				Method:   redirectMethod,
 				Response: resp,
@@ -625,7 +625,7 @@ func (c *Client) Do(req *Request) (*Response, error) {
 		}
 
 		var shouldRedirect bool
-		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, reqs[0])
+		redirectMethod, shouldRedirect, includeBody = redirectBehavior(req.Method, resp, ireq)
 		if !shouldRedirect {
 			return resp, nil
 		}
