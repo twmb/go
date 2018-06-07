@@ -245,7 +245,7 @@ func send(ireq *Request, rt RoundTripper, deadline time.Time) (resp *Response, d
 	}
 
 	if !deadline.IsZero() {
-		forkReq()
+		forkReq() // TODO alloc
 	}
 	stopTimer, didTimeout := setRequestCancel(req, rt, deadline)
 
@@ -290,10 +290,10 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 
 	initialReqCancel := req.Cancel // the user's original Request.Cancel, if any
 
-	cancel := make(chan struct{})
+	cancel := make(chan struct{}) // TODO alloc
 	req.Cancel = cancel
 
-	doCancel := func() {
+	doCancel := func() { // TODO alloc
 		// The newer way (the second way in the func comment):
 		close(cancel)
 
@@ -312,11 +312,11 @@ func setRequestCancel(req *Request, rt RoundTripper, deadline time.Time) (stopTi
 		}
 	}
 
-	stopTimerCh := make(chan struct{})
+	stopTimerCh := make(chan struct{}) // TODO alloc
 	var once sync.Once
 	stopTimer = func() { once.Do(func() { close(stopTimerCh) }) }
 
-	timer := time.NewTimer(time.Until(deadline))
+	timer := time.NewTimer(time.Until(deadline)) // TODO alloc
 	var timedOut atomicBool
 
 	go func() {
