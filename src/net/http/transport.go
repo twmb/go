@@ -299,18 +299,65 @@ func ProxyURL(fixedURL *url.URL) func(*Request) (*url.URL, error) {
 // from roundTrip.
 type transportRequest struct {
 	*Request                        // original request, not to be mutated
-	extra    Header                 // extra headers to write, or nil
+	extra    extraHeaders           // extra headers to write, or nil
 	trace    *httptrace.ClientTrace // optional
 
 	mu  sync.Mutex // guards err
 	err error      // first setError value for mapRoundTripError to consider
 }
 
-func (tr *transportRequest) extraHeaders() Header {
-	if tr.extra == nil {
-		tr.extra = make(Header)
+// extraHeaders tracks optional headers that we add on top of a request's
+// headers. We write headers directly rather than going through Header to
+// avoid allocations.
+type extraHeaders struct {
+	gzip      bool
+	closeConn bool
+	proxyAuth string
+}
+
+var noExtraHeaders = extraHeaders{}
+
+func (e extraHeaders) hasExtra() bool {
+	return e != noExtraHeaders
+}
+
+func (e extraHeaders) writeTo(w io.Writer) error {
+	ws, ok := w.(writeStringer)
+	if !ok {
+		ws = stringWriter{w}
 	}
-	return tr.extra
+	var err error
+	add := func(k, v string) {
+		if err != nil {
+			return
+		}
+		for _, s := range []string{k, ": ", v, "\r\n"} {
+			_, err = ws.WriteString(s)
+		}
+	}
+	// Note that we write canonical headers directly.
+	if e.gzip {
+		add("Accept-Encoding", "gzip")
+	}
+	if e.closeConn {
+		add("Connection", "close")
+	}
+	if e.proxyAuth != "" {
+		add("Proxy-Authorization", e.proxyAuth)
+	}
+	return err
+}
+
+func (e *extraHeaders) addGzip() {
+	e.gzip = true
+}
+
+func (e *extraHeaders) addCloseConn() {
+	e.closeConn = true
+}
+
+func (e *extraHeaders) setProxyAuth(pa string) {
+	e.proxyAuth = pa
 }
 
 func (tr *transportRequest) setError(err error) {
@@ -1114,9 +1161,7 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 	case cm.targetScheme == "http":
 		pconn.isProxy = true
 		if pa := cm.proxyAuth(); pa != "" {
-			pconn.mutateHeaderFunc = func(h Header) {
-				h.Set("Proxy-Authorization", pa)
-			}
+			pconn.addProxyAuth = pa
 		}
 	case cm.targetScheme == "https":
 		conn := pconn.conn
@@ -1307,10 +1352,10 @@ type persistConn struct {
 	canceledErr          error // set non-nil if conn is canceled
 	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
 	reused               bool  // whether conn has had successful request/response and is being reused.
-	// mutateHeaderFunc is an optional func to modify extra
-	// headers on each outbound request before it's written. (the
-	// original Request given to RoundTrip is not modified)
-	mutateHeaderFunc func(Header)
+
+	// addProxyAuth, if non empty, adds the Proxy-Authorization to outbound
+	// requests.
+	addProxyAuth string
 }
 
 func (pc *persistConn) maxHeaderResponseSize() int64 {
@@ -1834,12 +1879,10 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	}
 	pc.mu.Lock()
 	pc.numExpectedResponses++
-	headerFn := pc.mutateHeaderFunc
+	proxyAuth := pc.addProxyAuth
 	pc.mu.Unlock()
 
-	if headerFn != nil {
-		headerFn(req.extraHeaders())
-	}
+	req.extra.setProxyAuth(proxyAuth)
 
 	// Ask for a compressed version if the caller didn't set their
 	// own value for Accept-Encoding. We only attempt to
@@ -1863,7 +1906,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		// auto-decoding a portion of a gzipped document will just fail
 		// anyway. See https://golang.org/issue/8923
 		requestedGzip = true
-		req.extraHeaders().Set("Accept-Encoding", "gzip")
+		req.extra.addGzip()
 	}
 
 	var continueCh chan struct{}
@@ -1872,7 +1915,7 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 	}
 
 	if pc.t.DisableKeepAlives {
-		req.extraHeaders().Set("Connection", "close")
+		req.extra.addCloseConn()
 	}
 
 	gone := make(chan struct{})
@@ -2006,7 +2049,7 @@ func (pc *persistConn) closeLocked(err error) {
 			close(pc.closech)
 		}
 	}
-	pc.mutateHeaderFunc = nil
+	pc.addProxyAuth = ""
 }
 
 var portMap = map[string]string{
